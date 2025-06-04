@@ -19,7 +19,7 @@ function getMicColor(micId) {
 
 function fmtTime(tsMicro) {
   if (!tsMicro) return "--";
-  const date = new Date(tsMicro > 1e12 ? tsMicro / 1000 : tsMicro);
+  const date = new Date(tsMicro / 1000);  // microseconds to ms
   return date.toLocaleString();
 }
 
@@ -27,7 +27,7 @@ function MapCenterUpdater({ center, zoom, userTriggered, setUserTriggeredCenter 
   const map = useMap();
   useEffect(() => {
     if (userTriggered) {
-      map.flyTo(center, zoom, { animate: true, duration: 1.5 }); // <-- Smooth fly animation
+      map.flyTo(center, zoom, { animate: true, duration: 1.5 });
       setUserTriggeredCenter(false);
     }
   }, [center, zoom, userTriggered, setUserTriggeredCenter, map]);
@@ -42,50 +42,48 @@ export default function GunshotMap() {
   const [userTriggeredCenter, setUserTriggeredCenter] = useState(false);
   const [filter, setFilter] = useState("1h");
   const [expanded, setExpanded] = useState({});
-  const lastGunshotTimeRef = useRef(null);
+  const [highlightedGunshotId, setHighlightedGunshotId] = useState(null);
 
   const fetchSensors = async () => {
     try {
       const response = await fetch(`${BASE_URL}/get_sensors`);
-      if (!response.ok) throw new Error("Failed to fetch sensors");
       const data = await response.json();
       setSensors(data);
     } catch (error) {
+      console.error("Failed to fetch sensors", error);
       setSensors([]);
+    }
+  };
+
+  const fetchGunshotEvents = async () => {
+    try {
+      const response = await fetch(`${BASE_URL}/gunshot_events`);
+      const data = await response.json();
+      setGunshotLocations(data);
+    } catch (error) {
+      console.error("Failed to fetch gunshot events", error);
+      setGunshotLocations([]);
     }
   };
 
   useEffect(() => {
     fetchSensors();
-    let ws;
-    const connectWebSocket = () => {
-      ws = new WebSocket(`ws://127.0.0.1:8000/ws`);
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.type === "sensor_update") setSensors(data.sensors);
-        else if (data.gunshot_events) {
-          if (data.gunshot_events.length > 0) {
-            const newest = data.gunshot_events[data.gunshot_events.length - 1];
-            if (!lastGunshotTimeRef.current || newest.estimated_location?.time > lastGunshotTimeRef.current) {
-              lastGunshotTimeRef.current = newest.estimated_location?.time;
-              if (newest.estimated_location?.lat && newest.estimated_location?.lon) {
-                setMapCenter([newest.estimated_location.lat, newest.estimated_location.lon]);
-                setMapZoom(18);
-                setUserTriggeredCenter(true);
-              }
-            }
-          }
-          setGunshotLocations(data.gunshot_events);
-        }
-      };
-      ws.onclose = () => setTimeout(connectWebSocket, 5000);
-    };
-    connectWebSocket();
-    return () => { if (ws) ws.close(); };
+    fetchGunshotEvents();
+    const interval = setInterval(fetchGunshotEvents, 10000);
+    return () => clearInterval(interval);
   }, []);
 
   const now = Date.now();
-  const startTs = now - (filter === "1h" ? 1 : 24) * 60 * 60 * 1000;
+  let startTs;
+
+  if (filter === "2m") {
+    startTs = now - 2 * 60 * 1000; // 2 minutes
+  } else if (filter === "1h") {
+    startTs = now - 1 * 60 * 60 * 1000; // 1 hour
+  } else {
+    startTs = now - 24 * 60 * 60 * 1000; // 24 hours
+  }
+
   const endTs = now + 60 * 1000;
 
   const filteredSensors = sensors.filter(s =>
@@ -93,26 +91,21 @@ export default function GunshotMap() {
   );
 
   const filteredEvents = gunshotLocations.filter(e =>
-    e.estimated_location?.time / 1000 >= startTs && e.estimated_location?.time / 1000 <= endTs
+    e.timestamp / 1000 >= startTs && e.timestamp / 1000 <= endTs
   );
 
-  const centerOnLocation = (lat, lon, zoom = 18) => {
+  const centerOnLocation = (lat, lon, id, zoom = 18) => {
     setMapCenter([lat, lon]);
     setMapZoom(zoom);
     setUserTriggeredCenter(true);
+    setHighlightedGunshotId(id);
+    setTimeout(() => setHighlightedGunshotId(null), 3000);
   };
 
-  const estimateConfidenceRadius = (gunshot) => {
-    const speedOfSound = 343, timeError = 0.100;
-    const radius = speedOfSound * timeError;
-    const timestampMs = gunshot.estimated_location.time / 1000;
-    const localTime = new Date(timestampMs).toLocaleString();
-    return {
-      lat: gunshot.estimated_location.lat,
-      lon: gunshot.estimated_location.lon,
-      confidenceRadius: radius,
-      time: localTime,
-    };
+  const estimateConfidenceRadius = () => {
+    const speedOfSound = 343;
+    const timeError = 0.1; // 100 ms
+    return speedOfSound * timeError;
   };
 
   return (
@@ -123,6 +116,7 @@ export default function GunshotMap() {
         <div style={{ marginBottom: 16, textAlign: "center" }}>
           <label style={{ fontWeight: 600, fontSize: 18 }}>Sensors Table Filter: </label>
           <select value={filter} onChange={e => setFilter(e.target.value)}>
+            <option value="2m">Custom Time</option> {/* 🔥 NEW */}
             <option value="1h">Last 1 Hour</option>
             <option value="24h">Last 24 Hours</option>
           </select>
@@ -136,13 +130,11 @@ export default function GunshotMap() {
             </tr>
           </thead>
           <tbody>
-            {filteredSensors.map((sensor) => (
-              <tr key={sensor.mic_id}
-                style={{ cursor: "pointer", transition: "background 0.3s" }}
-                onClick={() => centerOnLocation(sensor.lat, sensor.lon, 18)}
+            {filteredSensors.map(sensor => (
+              <tr key={sensor.mic_id} style={{ cursor: "pointer", transition: "background 0.3s" }}
+                onClick={() => centerOnLocation(sensor.lat, sensor.lon)}
                 onMouseOver={e => e.currentTarget.style.background = "#f0f7ff"}
-                onMouseOut={e => e.currentTarget.style.background = "#fff"}
-              >
+                onMouseOut={e => e.currentTarget.style.background = "#fff"}>
                 <td style={{ color: getMicColor(sensor.mic_id), fontWeight: 600 }}>{sensor.mic_id}</td>
                 <td>{sensor.lat}</td>
                 <td>{sensor.lon}</td>
@@ -159,19 +151,27 @@ export default function GunshotMap() {
             </tr>
           </thead>
           <tbody>
-            {filteredEvents.map((event, i) => (
-              <Fragment key={i}>
-                <tr 
-                  style={{ cursor: "pointer", transition: "background 0.3s" }}
-                  onClick={() => centerOnLocation(event.estimated_location.lat, event.estimated_location.lon, 18)}
-                >
+            {filteredEvents.length === 0 ? (
+              <tr>
+                <td colSpan="6" style={{ textAlign: "center", padding: 20 }}>No gunshots detected in the selected time window</td>
+              </tr>
+            ) : filteredEvents.map((event) => (
+              <Fragment key={event.id}>
+                <tr style={{ cursor: "pointer", transition: "background 0.3s" }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    centerOnLocation(event.lat, event.lon, event.id)}}>
                   <td>{event.id}</td>
-                  <td>{event.estimated_location?.lat}</td>
-                  <td>{event.estimated_location?.lon}</td>
-                  <td>{fmtTime(event.estimated_location?.time)}</td>
-                  <td>{event.triggered_mics ? event.triggered_mics.length : 0}</td>
+                  <td>{event.lat}</td>
+                  <td>{event.lon}</td>
+                  <td>{fmtTime(event.timestamp)}</td>
+                  <td>{event.logs.length}</td>
                   <td>
-                    <button onClick={() => setExpanded(prev => ({ ...prev, [event.id]: !prev[event.id] }))}>
+                    <button onClick={(e) => {
+                      e.stopPropagation();
+                      setExpanded(prev => ({ ...prev, [event.id]: !prev[event.id] }))
+                    }}
+                      style={{ padding: "4px 12px", borderRadius: 6, border: "1px solid #ccc", background: "#f0f0f0", cursor: "pointer" }}>
                       {expanded[event.id] ? "Hide" : "Expand"}
                     </button>
                   </td>
@@ -179,24 +179,18 @@ export default function GunshotMap() {
                 {expanded[event.id] && (
                   <tr>
                     <td colSpan={6}>
-                      <table style={{ width: "100%", border: "1px solid #eee", borderRadius: 6, fontSize: "0.95rem" }}>
+                      <table style={{ width: "100%", border: "1px solid #eee", fontSize: "0.95rem", marginTop: 10 }}>
                         <thead>
                           <tr><th>Mic ID</th><th>Lat</th><th>Lon</th></tr>
                         </thead>
                         <tbody>
-                          {event.triggered_mics && event.triggered_mics.length > 0 ? (
-                            event.triggered_mics.map((mic, idx) => (
-                              <tr key={idx}>
-                                <td>{mic.mic_id}</td>
-                                <td>{mic.lat}</td>
-                                <td>{mic.lon}</td>
-                              </tr>
-                            ))
-                          ) : (
-                            <tr>
-                              <td colSpan="3" style={{ textAlign: "center" }}>No triggered sensors</td>
+                          {event.logs.map((mic, idx) => (
+                            <tr key={idx}>
+                              <td>{mic.mic_id}</td>
+                              <td>{mic.lat}</td>
+                              <td>{mic.lon}</td>
                             </tr>
-                          )}
+                          ))}
                         </tbody>
                       </table>
                     </td>
@@ -228,21 +222,26 @@ export default function GunshotMap() {
               </Popup>
             </Marker>
           ))}
-          {filteredEvents.map((gunshot, i) => {
-            if (!gunshot.estimated_location) return null;
-            const { lat, lon, confidenceRadius } = estimateConfidenceRadius(gunshot);
-            return (
-              <Fragment key={i}>
-                <Marker position={[lat, lon]} icon={gunshotIcon}>
-                  <Popup>
-                    Lat: {lat}<br />
-                    Lon: {lon}
-                  </Popup>
-                </Marker>
-                <Circle center={[lat, lon]} radius={confidenceRadius} pathOptions={{ color: "red", fillColor: "red", fillOpacity: 0.18 }} />
-              </Fragment>
-            );
-          })}
+          {filteredEvents.map((event) => (
+            <Fragment key={event.id}>
+              <Marker position={[event.lat, event.lon]} icon={gunshotIcon}>
+                <Popup>
+                  Lat: {event.lat}<br />
+                  Lon: {event.lon}
+                </Popup>
+              </Marker>
+              <Circle center={[event.lat, event.lon]} radius={estimateConfidenceRadius()} pathOptions={{ color: "red", fillColor: "red", fillOpacity: 0.18 }} />
+              {highlightedGunshotId === event.id && (
+                <Circle center={[event.lat, event.lon]} radius={150} pathOptions={{
+                  color: "blue",
+                  dashArray: "10, 10",
+                  weight: 2,
+                  opacity: 0.7,
+                  fillOpacity: 0.1
+                }} />
+              )}
+            </Fragment>
+          ))}
         </MapContainer>
       </div>
     </div>
